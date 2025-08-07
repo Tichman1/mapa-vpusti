@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="utf-8" />
+  <title>Evidenční mapa čištění vpustí – Live</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css" />
+  <style>
+    html { scroll-behavior: smooth; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; margin: 0; background-color: #f8f9fa; }
+    h1 { margin: 0; padding: 1rem 1.5rem; background-color: #fff; border-bottom: 1px solid #dee2e6; font-size: 1.5rem; color: #343a40; display: flex; justify-content: space-between; align-items: center; }
+    #map { height: 60vh; width: 100%; position: relative; }
+    .dataTables_wrapper { padding: 1rem; background-color: #fff; }
+    .legend { position: absolute; top: 80px; right: 15px; background: rgba(255, 255, 255, 0.9); padding: 8px 12px; border: 1px solid #ccc; border-radius: 5px; font-size: 0.9rem; z-index: 1000; box-shadow: 0 1px 5px rgba(0,0,0,0.2); }
+    .legend span { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+    .legend span:last-child { margin-bottom: 0; }
+    .swatch { width: 14px; height: 14px; border-radius: 50%; display: inline-block; border: 1px solid rgba(0,0,0,0.2); }
+    #loader { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); z-index: 2000; background: rgba(255,255,255,0.8); padding: 20px; border-radius: 8px; font-size: 1.2rem; display: none; }
+    #counter { font-size: 1.1rem; font-weight: normal; color: #6c757d; background-color: #e9ecef; padding: 0.3rem 0.8rem; border-radius: 0.25rem; }
+    #error-banner { display: none; padding: 1rem; margin: 1rem; background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; border-radius: .25rem; text-align: left; white-space: pre-wrap; font-size: 0.9rem; }
+    footer { text-align: center; padding: 1.5rem; font-size: 0.9rem; color: #6c757d; border-top: 1px solid #dee2e6; margin-top: 1rem; }
+    td a, .leaflet-popup-content a { color: #007bff; text-decoration: none; }
+    td a:hover, .leaflet-popup-content a:hover { text-decoration: underline; }
+    #refresh-btn { background: #007bff; color: white; border: none; padding: 0.5rem 1rem; border-radius: 5px; cursor: pointer; font-size: 1rem; }
+    #refresh-btn:hover { background: #0056b3; }
+    .marker-highlight { stroke: #ffc107; stroke-width: 4; }
+  </style>
+</head>
+<body>
+  <h1>
+    <span>Evidenční mapa a seznam dešťových vpustí</span>
+    <span id="counter"></span>
+    <button id="refresh-btn" title="Aktualizovat data">🔄</button>
+  </h1>
+  <div id="map">
+      <div id="loader">🔄 Načítám data...</div>
+  </div>
+  <div class="legend">
+    <span><span class="swatch" style="background:#28a745"></span>Vyčištěné</span>
+    <span><span class="swatch" style="background:#dc3545"></span>Nečištěné</span>
+    <span><span class="swatch" style="background:#007bff"></span>Nespravuje TS</span>
+  </div>
+
+  <div id="error-banner"></div>
+
+  <table id="vpusti" class="display" style="width:100%">
+    <thead>
+      <tr>
+        <th>Inventární číslo</th>
+        <th>Lokalita</th>
+        <th>Souřadnice</th>
+        <th>Celkem čištění</th>
+        <th>Stav</th>
+        <th>Správa</th>
+        <th>Poznámka</th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+
+  <footer>
+    <span id="footer-text"></span>
+  </footer>
+
+  <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+  <script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const SHEET_URL = 'https://script.google.com/macros/s/AKfycbz1RkMUtXrRchD-K5Cna7Rf0o6oGBZJx6ER5utd7JszZIVYPjU3Y5S4hjsxWL0dCGT5-g/exec';
+
+    let map;
+    let dataTable;
+    let markersLayer = L.layerGroup();
+    let allMarkers = [];
+
+    function formatCoordinates(lat, lng) {
+      if (typeof lat !== 'number' || typeof lng !== 'number') return 'Nezadáno';
+      const latAbs = Math.abs(lat).toFixed(7);
+      const lngAbs = Math.abs(lng).toFixed(7);
+      return `${latAbs}${lat >= 0 ? 'N' : 'S'}, ${lngAbs}${lng >= 0 ? 'E' : 'W'}`;
+    }
+
+    function fetchAndUpdateData() {
+        if (!SHEET_URL || SHEET_URL.includes('ZDE_VLOZ')) {
+            alert('CHYBA: V kódu chybí URL adresa z Google Apps Scriptu.');
+            return;
+        }
+        $('#loader').show();
+
+        $.ajax({
+            url: SHEET_URL,
+            dataType: 'jsonp',
+            success: function(data) {
+                $('#error-banner').hide();
+                if (data.error) throw new Error(`Chyba ve skriptu: ${data.message}`);
+                updateUI(data);
+            },
+            error: function(jqXHR, textStatus, errorThrown) {
+                console.error('AJAX Error:', { status: jqXHR.status, statusText: jqXHR.statusText, readyState: jqXHR.readyState, responseText: jqXHR.responseText, textStatus: textStatus, errorThrown: errorThrown });
+                let detailedMessage = '<strong>CHYBA: Nepodařilo se načíst data z Google Sheets.</strong>\n\n';
+                detailedMessage += 'Zkontrolujte prosím, zda je URL adresa správná a zda je skript správně nasazen s přístupem pro "Kohokoli".';
+                $('#error-banner').html(detailedMessage).show();
+            },
+            complete: function() {
+                $('#loader').hide();
+            }
+        });
+    }
+
+    function updateUI(vpustiData) {
+      dataTable.clear();
+      markersLayer.clearLayers();
+      allMarkers = [];
+      let grandTotalCleanings = 0;
+
+      vpustiData.forEach(vp => {
+        if (!vp.lat || !vp.lng || !vp.inv) return;
+
+        let totalCleaningsForGully = 0;
+        let cleaningHistoryHtml = '';
+        
+        Object.keys(vp).filter(key => key.startsWith('cisteni')).sort().forEach(key => {
+            const year = key.split('_')[1] || key.replace('cisteni','');
+            const count = Number(vp[key]) || 0;
+            if (count > 0) {
+              totalCleaningsForGully += count;
+              cleaningHistoryHtml += `<br/>Čištění ${year}: ${count}x`;
+            }
+        });
+        
+        grandTotalCleanings += totalCleaningsForGully;
+
+        const isManagedByTS = !(vp.sprava && String(vp.sprava).toLowerCase().includes('nespravuje'));
+        let color;
+        if (!isManagedByTS) color = '#007bff';
+        else color = vp.isCleaned ? '#28a745' : '#dc3545';
+        
+        const statusLabel = vp.isCleaned ? 'Vyčištěné' : 'Nečištěné';
+        const managementLabel = isManagedByTS ? 'TS' : 'Nespravuje TS';
+        const coordStr = formatCoordinates(vp.lat, vp.lng);
+        
+        const streetViewUrl = `https://www.google.com/maps?q=&layer=c&cbll=${vp.lat},${vp.lng}`;
+        const coordLink = `<a href="${streetViewUrl}" target="_blank" title="Zobrazit na Street View">${coordStr} 📸</a>`;
+
+        dataTable.row.add([ vp.inv, vp.loc || '', coordLink, totalCleaningsForGully, statusLabel, managementLabel, vp.note || '' ]);
+
+        const marker = L.circleMarker([vp.lat, vp.lng], {
+            radius: 5,
+            color: '#ffffff',
+            weight: 1.5,
+            fillColor: color,
+            fillOpacity: 0.9,
+            rowId: 'row-' + vp.inv
+        }).bindPopup(`<strong>${vp.inv}</strong><br/>${vp.loc || ''}<br/>${coordLink}<br/>Stav: ${statusLabel}<br/>Správa: ${managementLabel}<br/><b>Celkem čištění: ${totalCleaningsForGully}x</b>${cleaningHistoryHtml}${vp.note ? '<br/>Pozn.: ' + vp.note : ''}`);
+        
+        allMarkers.push(marker);
+      });
+
+      $('#counter').text(`Celkem čištění: ${grandTotalCleanings}`);
+      dataTable.draw(); 
+    }
+    
+    function syncMapWithTable() {
+        markersLayer.clearLayers();
+        const visibleMarkers = [];
+        dataTable.rows({ search: 'applied' }).every(function() {
+            const invNum = this.data()[0];
+            const targetMarker = allMarkers.find(m => m.options.rowId === 'row-' + invNum);
+            if(targetMarker) {
+                targetMarker.addTo(markersLayer);
+                visibleMarkers.push(targetMarker);
+            }
+        });
+
+        if (visibleMarkers.length > 0 && visibleMarkers.length < allMarkers.length) {
+            const group = L.featureGroup(visibleMarkers);
+            map.fitBounds(group.getBounds().pad(0.2));
+        }
+    }
+
+    document.addEventListener('DOMContentLoaded', () => {
+      map = L.map('map').setView([50.143, 15.12], 14);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' }).addTo(map);
+      markersLayer.addTo(map);
+
+      dataTable = $('#vpusti').DataTable({
+        language: { url: '//cdn.datatables.net/plug-ins/1.13.8/i18n/cs.json' },
+        order: [[3, 'desc']],
+        pageLength: 25,
+        rowId: 'inv'
+      });
+      
+      $('#refresh-btn').on('click', fetchAndUpdateData);
+      dataTable.on('draw.dt', syncMapWithTable);
+
+      const defaultMarkerStyle = { radius: 5, weight: 1.5 };
+      const highlightMarkerStyle = { radius: 8, weight: 3 };
+
+      $('#vpusti tbody').on('mouseenter', 'tr', function () {
+          const invNum = dataTable.row(this).data()[0];
+          const targetMarker = allMarkers.find(m => m.options.rowId === 'row-' + invNum);
+          if (targetMarker) targetMarker.setStyle(highlightMarkerStyle).bringToFront();
+      }).on('mouseleave', 'tr', function () {
+          const invNum = dataTable.row(this).data()[0];
+          const targetMarker = allMarkers.find(m => m.options.rowId === 'row-' + invNum);
+          if (targetMarker) targetMarker.setStyle(defaultMarkerStyle);
+      });
+
+      $('#vpusti tbody').on('click', 'tr', function () {
+          const rowData = dataTable.row(this).data();
+          if (!rowData) return;
+          const invNum = rowData[0];
+          const targetMarker = allMarkers.find(m => m.options.rowId === 'row-' + invNum);
+          if (targetMarker) {
+              map.setView(targetMarker.getLatLng(), 17);
+              targetMarker.openPopup();
+              // VYLEPŠENÍ: Plynule posune stránku úplně nahoru
+              document.body.scrollIntoView();
+          }
+      });
+
+      document.getElementById('footer-text').innerHTML = `Vytvořil Ing. Jan Tichý &copy; ${new Date().getFullYear()}`;
+      fetchAndUpdateData();
+    });
+  </script>
+</body>
+</html>
